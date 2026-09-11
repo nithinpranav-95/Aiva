@@ -1,167 +1,81 @@
-import speech_recognition as sr
-import webbrowser
-import google.generativeai as genai
-import json
-import time
+from datetime import date
+import os
 
-# ============================================
-# CONFIGURATION — Replace with your key!
-# ============================================
-GEMINI_API_KEY = "AQ.Ab8RN6Kg214lF209D_UKVnaYBfAIwmJjorFc5opTb_hH7ZpEpA"
+import gspread
+import requests
+import xml.etree.ElementTree as ET
+from dotenv import load_dotenv
+from google.oauth2.service_account import Credentials
 
-# Setup Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-model_ai = genai.GenerativeModel("gemini-3.6-flash")
+load_dotenv()
 
-# ============================================
-# WEBSITES (fallback if LLM fails)
-# ============================================
-websites = {
-    "youtube"  : "https://youtube.com",
-    "github"   : "https://github.com",
-    "google"   : "https://google.com",
-    "netflix"  : "https://netflix.com",
-    "linkedin" : "https://linkedin.com",
-    "gmail"    : "https://gmail.com",
-    "twitter"  : "https://twitter.com",
-    "reddit"   : "https://reddit.com",
-    "instagram": "https://instagram.com",
-    "whatsapp" : "https://web.whatsapp.com",
-}
+SHEET_ID = os.environ["SHEET_ID"]
+SERVICE_ACCOUNT_FILE = os.environ["GOOGLE_SERVICE_ACCOUNT_FILE"]
+SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+WORD_OF_DAY_TAB = "Word of the Day"
 
-# ============================================
-# LISTEN — Captures voice input
-# ============================================
-def listen():
-    r = sr.Recognizer()
-    with sr.Microphone() as source:
-        print("\n🎤 Listening...")
-        r.adjust_for_ambient_noise(source, duration=1)
-        try:
-            audio = r.listen(source, timeout=5)
-        except sr.WaitTimeoutError:
-            print("No speech detected!")
-            return None
+
+def get_word_of_the_day():
+    """Fetch Merriam-Webster's real, official word of the day."""
+    response = requests.get("https://www.merriam-webster.com/wotd/feed/rss2")
+    root = ET.fromstring(response.text)
+    first_item = root.find("channel/item")
+    word = first_item.find("title").text.strip()
+    namespace = {"merriam": "https://www.merriam-webster.com/word-of-the-day"}
+    meaning = first_item.find("merriam:shortdef", namespace).text.strip()
+    return {"word": word, "meaning": meaning}
+
+
+def get_sheet():
+    """Log into Sheets as the service account, return the Word of the Day tab."""
+    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SHEETS_SCOPES)
+    gc = gspread.authorize(creds)
+    spreadsheet = gc.open_by_key(SHEET_ID)
     try:
-        text = r.recognize_google(audio)
-        print(f"🗣️  You said: {text}")
-        return text.lower()
-    except sr.UnknownValueError:
-        print("❌ Didn't catch that!")
-        return None
-    except sr.RequestError:
-        print("❌ Check internet connection!")
-        return None
+        worksheet = spreadsheet.worksheet(WORD_OF_DAY_TAB)
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(title=WORD_OF_DAY_TAB, rows=1000, cols=3)
+        worksheet.append_row(["Date", "Word", "Meaning"])
+    return worksheet
 
-# ============================================
-# ASK LLM — Sends command to Gemini
-# ============================================
-def ask_llm(command):
-    prompt = f"""
-    User voice command: "{command}"
-    
-    Your job: extract what website to open.
-    
-    Rules:
-    - If user says a website name → return that URL
-    - If user wants to search → return Google search URL
-    - If user says "open YouTube" → return youtube.com
-    - If unclear → return Google search with the command
-    
-    Return ONLY this JSON format, nothing else:
-    {{"url": "https://...", "site": "sitename"}}
-    
-    Examples:
-    "open youtube" → {{"url": "https://youtube.com", "site": "YouTube"}}
-    "search python tutorials" → {{"url": "https://google.com/search?q=python+tutorials", "site": "Google"}}
-    "go to github" → {{"url": "https://github.com", "site": "GitHub"}}
-    """
 
-    try:
-        print("🧠 Thinking...")
-        response = model_ai.generate_content(prompt)
-        text = response.text.strip()
-
-        # Clean response
-        text = text.replace("```json", "")
-        text = text.replace("```", "")
-        text = text.strip()
-
-        result = json.loads(text)
-        return result
-
-    except json.JSONDecodeError:
-        print("❌ LLM returned invalid JSON!")
-        return None
-    except Exception as e:
-        print(f"❌ LLM Error: {e}")
-        return None
-
-# ============================================
-# FALLBACK — Simple keyword matching
-# ============================================
-def fallback_open(command):
-    for site, url in websites.items():
-        if site in command:
-            return {"url": url, "site": site}
-    if "search" in command:
-        query = command.replace("search", "").strip()
-        query = query.replace(" ", "+")
-        return {
-            "url": f"https://google.com/search?q={query}",
-            "site": "Google Search"
-        }
+def already_logged_today(worksheet, today):
+    """Read every row already in the sheet, and check if today's date is one of them."""
+    records = worksheet.get_all_records()
+    for row in records:
+        if row.get("Date") == today:
+            return row
     return None
 
-# ============================================
-# MAIN AGENT — Runs the loop
-# ============================================
-def run_agent():
-    print("="*45)
-    print("🤖  Gemini Voice Agent — Ready!")
-    print("="*45)
-    print("💡 Commands you can try:")
-    print("   'Open YouTube'")
-    print("   'Go to GitHub'")
-    print("   'Search Python tutorials'")
-    print("   'Open LinkedIn'")
-    print("   Say 'stop' or 'exit' to quit!")
-    print("="*45)
 
-    while True:
-        # Step 1 — Listen
-        command = listen()
+def main():
+    worksheet = get_sheet()
+    today = date.today().isoformat()
 
-        if not command:
-            continue
+    existing = already_logged_today(worksheet, today)
+    if existing:
+        print(f"Already logged today: {existing['Word']} — {existing['Meaning']}")
+        return
 
-        # Step 2 — Check for stop
-        if "stop" in command or "exit" in command:
-            print("\n👋 Goodbye Nithin!")
-            break
+    word_data = get_word_of_the_day()
+    worksheet.append_row([today, word_data["word"], word_data["meaning"]])
+    print(f"Today's word: {word_data['word']} — {word_data['meaning']}")
 
-        # Step 3 — Ask Gemini
-        result = ask_llm(command)
+def get_news(count=5):
+    """Fetch today's top headlines from BBC News."""
+    response = requests.get("http://feeds.bbci.co.uk/news/rss.xml")
+    root = ET.fromstring(response.text)
 
-        # Step 4 — Fallback if LLM fails
-        if not result:
-            print("⚠️  Using fallback matching...")
-            result = fallback_open(command)
+    items = root.findall("channel/item")
+    headlines = []
+    for item in items[:count]:
+        title = item.find("title").text.strip()
+        headlines.append(title)
 
-        # Step 5 — Open website
-        if result:
-            url  = result["url"]
-            site = result.get("site", "website")
-            print(f"✅ Opening {site}...")
-            print(f"🌐 URL: {url}")
-            webbrowser.open(url)
-        else:
-            print("❌ Couldn't find website!")
+    return headlines
 
-        time.sleep(1)
-
-# ============================================
-# RUN!
-# ============================================
+for headline in get_news():
+    print(headline)
+    
 if __name__ == "__main__":
-    run_agent()
+    main()
