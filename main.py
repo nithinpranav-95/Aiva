@@ -8,6 +8,7 @@ import requests
 import xml.etree.ElementTree as ET
 from dotenv import load_dotenv
 from google import genai
+from google.auth.transport.requests import AuthorizedSession
 from google.oauth2.service_account import Credentials
 
 load_dotenv()
@@ -17,14 +18,18 @@ load_dotenv()
 logging.getLogger("google_genai.models").setLevel(logging.ERROR)
 
 SHEET_ID = os.environ["SHEET_ID"]
+DAILY_TRACKER_DOC_ID = os.environ["DAILY_TRACKER_DOC_ID"]
 SERVICE_ACCOUNT_FILE = os.environ["GOOGLE_SERVICE_ACCOUNT_FILE"]
-SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/documents",
+]
 
 WORD_OF_DAY_TAB = "Word of the Day"
 WORD_OF_DAY_HEADER = ["Date", "Word", "Meaning"]
 
-TASKS_TAB = "Tasks"
-TASKS_HEADER = ["Date Added", "Task", "Due", "Status"]
+DOCS_API = "https://docs.googleapis.com/v1/documents"
+TODO_HEADING = "To-do-List"
 
 GEMINI_MODEL = "gemini-3.6-flash"
 gemini = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
@@ -58,13 +63,17 @@ def classify_intent(text):
     return label if label in INTENTS else "none"
 
 
-# ---------- Google Sheets ----------
+# ---------- Google login ----------
+
+def get_google_credentials():
+    """AIVA's service account identity, allowed to use Sheets and Docs."""
+    return Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=GOOGLE_SCOPES)
+
 
 def get_sheet(tab_name, header):
-    """Log into Sheets as the service account, return the given tab —
+    """Open the given tab of the Daily_tracker spreadsheet —
     creating it with this header if it doesn't exist yet."""
-    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SHEETS_SCOPES)
-    gc = gspread.authorize(creds)
+    gc = gspread.authorize(get_google_credentials())
     spreadsheet = gc.open_by_key(SHEET_ID)
     try:
         worksheet = spreadsheet.worksheet(tab_name)
@@ -134,7 +143,7 @@ def show_news():
         print(f"  - {headline}")
 
 
-# ---------- To-dos ----------
+# ---------- To-dos (Daily Tracker Google Doc) ----------
 
 def parse_task(raw_text):
     """Ask Gemini to turn a spoken sentence into a clean task title + due date."""
@@ -151,13 +160,73 @@ def parse_task(raw_text):
     return json.loads(text)
 
 
+def paragraph_text(paragraph):
+    return "".join(
+        element.get("textRun", {}).get("content", "") for element in paragraph.get("elements", [])
+    ).strip()
+
+
+def utf16_length(text):
+    """Google Docs counts positions in UTF-16 units (an emoji counts as 2)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def add_item_to_todo_list(item):
+    """Add one checkbox item at the end of the list under the To-do-List heading."""
+    session = AuthorizedSession(get_google_credentials())
+    response = session.get(f"{DOCS_API}/{DAILY_TRACKER_DOC_ID}")
+    response.raise_for_status()
+    content = response.json()["body"]["content"]
+
+    heading_position = None
+    for position, element in enumerate(content):
+        if "paragraph" in element and paragraph_text(element["paragraph"]) == TODO_HEADING:
+            heading_position = position
+            break
+    if heading_position is None:
+        raise RuntimeError(f"couldn't find a '{TODO_HEADING}' heading in Daily Tracker")
+
+    # Walk past the checklist items already under the heading to find the last one.
+    last = content[heading_position]
+    for element in content[heading_position + 1:]:
+        if "paragraph" in element and element["paragraph"].get("bullet"):
+            last = element
+        else:
+            break
+    list_is_empty = last is content[heading_position]
+
+    # Insert "\n<item>" just before the last paragraph's own line break,
+    # which creates a new paragraph directly after it.
+    new_start = last["endIndex"]
+    new_range = {"startIndex": new_start, "endIndex": new_start + utf16_length(item) + 1}
+    changes = [
+        {"insertText": {"location": {"index": last["endIndex"] - 1}, "text": "\n" + item}},
+        # Don't inherit a strikethrough if the item above was already ticked off.
+        {"updateTextStyle": {"range": new_range, "textStyle": {"strikethrough": False},
+                             "fields": "strikethrough"}},
+    ]
+    if list_is_empty:
+        # First item: it would inherit the heading's style, so turn it into a checkbox.
+        changes += [
+            {"updateParagraphStyle": {"range": new_range,
+                                      "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                                      "fields": "namedStyleType"}},
+            {"createParagraphBullets": {"range": new_range, "bulletPreset": "BULLET_CHECKBOX"}},
+        ]
+
+    session.post(
+        f"{DOCS_API}/{DAILY_TRACKER_DOC_ID}:batchUpdate", json={"requests": changes}
+    ).raise_for_status()
+
+
 def add_todo(raw_text):
-    """Add one dictated/typed task to the Tasks sheet."""
+    """Turn a dictated/typed sentence into a to-do and add it to Daily Tracker."""
     parsed = parse_task(raw_text)
-    worksheet = get_sheet(TASKS_TAB, TASKS_HEADER)
-    today = date.today().isoformat()
-    worksheet.append_row([today, parsed["task"], parsed.get("due", ""), "Open"])
-    print(f"AIVA: Added '{parsed['task']}' (due: {parsed.get('due') or 'no date'})")
+    item = parsed["task"]
+    if parsed.get("due"):
+        item += f" (due {parsed['due']})"
+    add_item_to_todo_list(item)
+    print(f"AIVA: Added '{item}' to your To-do-List")
 
 
 # ---------- Conversation loop ----------
