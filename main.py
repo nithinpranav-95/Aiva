@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from functools import lru_cache
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import xml.etree.ElementTree as ET
 from dotenv import load_dotenv
 from google import genai
 from google.auth.transport.requests import AuthorizedSession
+from google.genai import types
 from google.oauth2.service_account import Credentials
 
 load_dotenv()
@@ -31,8 +33,14 @@ WORD_OF_DAY_HEADER = ["Date", "Word", "Meaning"]
 DOCS_API = "https://docs.googleapis.com/v1/documents"
 TODO_HEADING = "To-do-List"
 
-GEMINI_MODEL = "gemini-3.6-flash"
-gemini = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+# The lite model answers in about a second and has its own free daily limit.
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+# By default the library silently retries up to 5 times (~15-20s of waiting).
+# Two attempts keeps a busy moment down to a second or two.
+gemini = genai.Client(
+    api_key=os.environ["GEMINI_API_KEY"],
+    http_options=types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=2)),
+)
 
 INTENTS = ["word_of_day", "news", "todo", "bye"]
 EXIT_WORDS = ["bye", "exit", "quit"]
@@ -64,17 +72,29 @@ def classify_intent(text):
 
 
 # ---------- Google login ----------
+# @lru_cache remembers a function's result, so AIVA logs into Google once per
+# session instead of on every request (that login alone took over a second).
 
+@lru_cache
 def get_google_credentials():
     """AIVA's service account identity, allowed to use Sheets and Docs."""
     return Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=GOOGLE_SCOPES)
 
 
+@lru_cache
+def get_spreadsheet():
+    return gspread.authorize(get_google_credentials()).open_by_key(SHEET_ID)
+
+
+@lru_cache
+def get_docs_session():
+    return AuthorizedSession(get_google_credentials())
+
+
 def get_sheet(tab_name, header):
     """Open the given tab of the Daily_tracker spreadsheet —
     creating it with this header if it doesn't exist yet."""
-    gc = gspread.authorize(get_google_credentials())
-    spreadsheet = gc.open_by_key(SHEET_ID)
+    spreadsheet = get_spreadsheet()
     try:
         worksheet = spreadsheet.worksheet(tab_name)
     except gspread.WorksheetNotFound:
@@ -172,8 +192,16 @@ def utf16_length(text):
 
 
 def add_item_to_todo_list(item):
-    """Add one checkbox item at the end of the list under the To-do-List heading."""
-    session = AuthorizedSession(get_google_credentials())
+    """Add one checkbox item under today's date heading in the To-do-List section,
+    starting a new date heading if today doesn't have one yet.
+
+    The section looks like:
+        To-do-List               (Heading 1)
+        Friday, 11 Sep 2026      (Heading 2)
+        [ ] a to-do
+        [ ] another to-do
+    """
+    session = get_docs_session()
     response = session.get(f"{DOCS_API}/{DAILY_TRACKER_DOC_ID}")
     response.raise_for_status()
     content = response.json()["body"]["content"]
@@ -186,33 +214,66 @@ def add_item_to_todo_list(item):
     if heading_position is None:
         raise RuntimeError(f"couldn't find a '{TODO_HEADING}' heading in Daily Tracker")
 
-    # Walk past the checklist items already under the heading to find the last one.
+    # Walk through the section (date headings and checkbox items) to find where it ends,
+    # and where each day's group of to-dos ends.
     last = content[heading_position]
+    day_group_ends = {}
+    current_day = None
     for element in content[heading_position + 1:]:
-        if "paragraph" in element and element["paragraph"].get("bullet"):
+        paragraph = element.get("paragraph")
+        if paragraph is None:
+            break
+        if paragraph.get("bullet"):
             last = element
+        elif paragraph["paragraphStyle"].get("namedStyleType") == "HEADING_2":
+            last = element
+            current_day = paragraph_text(paragraph)
         else:
             break
-    list_is_empty = last is content[heading_position]
+        if current_day is not None:
+            day_group_ends[current_day] = element
 
-    # Insert "\n<item>" just before the last paragraph's own line break,
-    # which creates a new paragraph directly after it.
-    new_start = last["endIndex"]
-    new_range = {"startIndex": new_start, "endIndex": new_start + utf16_length(item) + 1}
-    changes = [
-        {"insertText": {"location": {"index": last["endIndex"] - 1}, "text": "\n" + item}},
-        # Don't inherit a strikethrough if the item above was already ticked off.
-        {"updateTextStyle": {"range": new_range, "textStyle": {"strikethrough": False},
-                             "fields": "strikethrough"}},
-    ]
-    if list_is_empty:
-        # First item: it would inherit the heading's style, so turn it into a checkbox.
+    # If today already has a heading (even with a later day below it), add to that group.
+    today_label = date.today().strftime("%A, %d %b %Y")
+    today_has_heading = today_label in day_group_ends
+    if today_has_heading:
+        last = day_group_ends[today_label]
+    last_is_checkbox = bool(last["paragraph"].get("bullet"))
+
+    # New text goes just before the last paragraph's own line break,
+    # which creates new paragraphs directly after it.
+    insert_at = last["endIndex"] - 1
+    start = last["endIndex"]
+    changes = []
+
+    if today_has_heading:
+        text = "\n" + item
+        item_range = {"startIndex": start, "endIndex": start + utf16_length(item) + 1}
+        changes.append({"insertText": {"location": {"index": insert_at}, "text": text}})
+    else:
+        text = "\n" + today_label + "\n" + item
+        heading_end = start + utf16_length(today_label) + 1
+        heading_range = {"startIndex": start, "endIndex": heading_end}
+        item_range = {"startIndex": heading_end, "endIndex": heading_end + utf16_length(item) + 1}
         changes += [
-            {"updateParagraphStyle": {"range": new_range,
-                                      "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            {"insertText": {"location": {"index": insert_at}, "text": text}},
+            {"updateParagraphStyle": {"range": heading_range,
+                                      "paragraphStyle": {"namedStyleType": "HEADING_2"},
                                       "fields": "namedStyleType"}},
-            {"createParagraphBullets": {"range": new_range, "bulletPreset": "BULLET_CHECKBOX"}},
+            {"deleteParagraphBullets": {"range": heading_range}},
         ]
+
+    new_range = {"startIndex": start, "endIndex": item_range["endIndex"]}
+    # Don't inherit a strikethrough if the item above was already ticked off.
+    changes.append({"updateTextStyle": {"range": new_range, "textStyle": {"strikethrough": False},
+                                        "fields": "strikethrough"}})
+    changes.append({"updateParagraphStyle": {"range": item_range,
+                                             "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                                             "fields": "namedStyleType"}})
+    if not last_is_checkbox:
+        # Written right after a heading, so it isn't a checkbox yet.
+        changes.append({"createParagraphBullets": {"range": item_range,
+                                                   "bulletPreset": "BULLET_CHECKBOX"}})
 
     session.post(
         f"{DOCS_API}/{DAILY_TRACKER_DOC_ID}:batchUpdate", json={"requests": changes}
@@ -274,7 +335,13 @@ def main():
             else:
                 print(f"AIVA: {HELP_TEXT}")
         except Exception as error:
-            print(f"AIVA: Sorry, something went wrong: {error}")
+            if getattr(error, "code", None) == 429:
+                if "PerDay" in str(error):
+                    print("AIVA: I've used up today's free Gemini requests. Try again tomorrow.")
+                else:
+                    print("AIVA: Gemini is getting too many requests right now. Give it a minute.")
+            else:
+                print(f"AIVA: Sorry, something went wrong: {error}")
 
 
 if __name__ == "__main__":
