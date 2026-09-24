@@ -1,0 +1,6 @@
+[theme]
+# Same blue accent as the ReviewIQ dashboard
+primaryColor = "#2563EB"
+
+[browser]
+gatherUsageStats = false

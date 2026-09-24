@@ -3,6 +3,7 @@ from functools import lru_cache
 import json
 import logging
 import os
+from pathlib import Path
 
 import gspread
 import requests
@@ -13,7 +14,10 @@ from google.auth.transport.requests import AuthorizedSession
 from google.genai import types
 from google.oauth2.service_account import Credentials
 
-load_dotenv()
+# Find .env and credentials next to this file, so AIVA works no matter
+# which folder it's started from.
+PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(PROJECT_ROOT / ".env")
 
 # google-genai prints a one-time "automatic function calling" notice that
 # would otherwise pop up in the middle of AIVA's conversation.
@@ -21,7 +25,7 @@ logging.getLogger("google_genai.models").setLevel(logging.ERROR)
 
 SHEET_ID = os.environ["SHEET_ID"]
 DAILY_TRACKER_DOC_ID = os.environ["DAILY_TRACKER_DOC_ID"]
-SERVICE_ACCOUNT_FILE = os.environ["GOOGLE_SERVICE_ACCOUNT_FILE"]
+SERVICE_ACCOUNT_FILE = str(PROJECT_ROOT / os.environ["GOOGLE_SERVICE_ACCOUNT_FILE"])
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/documents",
@@ -125,8 +129,8 @@ def already_logged_today(worksheet, today):
     return None
 
 
-def show_word_of_the_day():
-    """Show today's word, saving it to the sheet the first time it's asked for."""
+def todays_word():
+    """Today's word and meaning, saving it to the sheet the first time it's asked for."""
     worksheet = get_sheet(WORD_OF_DAY_TAB, WORD_OF_DAY_HEADER)
     today = date.today().isoformat()
 
@@ -137,8 +141,12 @@ def show_word_of_the_day():
         word_data = get_word_of_the_day()
         word, meaning = word_data["word"], word_data["meaning"]
         worksheet.append_row([today, word, meaning])
+    return {"word": word, "meaning": meaning}
 
-    print(f"AIVA: Today's word is '{word}' — {meaning}")
+
+def word_of_the_day_message():
+    word = todays_word()
+    return f"Today's word is **{word['word']}** — {word['meaning']}"
 
 
 # ---------- News ----------
@@ -157,10 +165,11 @@ def get_news(count=5):
     return headlines
 
 
-def show_news():
-    print("AIVA: Here are today's top headlines:")
+def news_message():
+    lines = ["Here are today's top headlines:"]
     for headline in get_news():
-        print(f"  - {headline}")
+        lines.append(f"- {headline}")
+    return "\n".join(lines)
 
 
 # ---------- To-dos (Daily Tracker Google Doc) ----------
@@ -287,7 +296,62 @@ def add_todo(raw_text):
     if parsed.get("due"):
         item += f" (due {parsed['due']})"
     add_item_to_todo_list(item)
-    print(f"AIVA: Added '{item}' to your To-do-List")
+    return f"Added **{item}** to your To-do-List"
+
+
+def todays_todos():
+    """Today's items from the To-do-List section, as dicts with text, done and position.
+
+    Google's API can't read or tick the checkbox itself, so a crossed-out item
+    counts as done (Docs crosses items out when you tick them).
+    """
+    session = get_docs_session()
+    response = session.get(f"{DOCS_API}/{DAILY_TRACKER_DOC_ID}")
+    response.raise_for_status()
+    content = response.json()["body"]["content"]
+
+    today_label = date.today().strftime("%A, %d %b %Y")
+    in_section = in_today = False
+    todos = []
+    for element in content:
+        paragraph = element.get("paragraph")
+        if paragraph is None:
+            continue
+        text = paragraph_text(paragraph)
+        style = paragraph["paragraphStyle"].get("namedStyleType")
+        if text == TODO_HEADING:
+            in_section = True
+            continue
+        if not in_section:
+            continue
+        if style == "HEADING_2":
+            in_today = text == today_label
+        elif paragraph.get("bullet"):
+            if in_today and text:
+                runs = [e.get("textRun", {}) for e in paragraph.get("elements", [])]
+                done = any(r.get("textStyle", {}).get("strikethrough") for r in runs if r.get("content", "").strip())
+                todos.append({"text": text, "done": done,
+                              "start": element["startIndex"], "end": element["endIndex"] - 1})
+        else:
+            break
+    return todos
+
+
+def set_todo_done(todo, done=True):
+    """Cross an item out (or back in) in the Doc."""
+    get_docs_session().post(
+        f"{DOCS_API}/{DAILY_TRACKER_DOC_ID}:batchUpdate",
+        json={"requests": [{"updateTextStyle": {
+            "range": {"startIndex": todo["start"], "endIndex": todo["end"]},
+            "textStyle": {"strikethrough": done}, "fields": "strikethrough"}}]},
+    ).raise_for_status()
+
+
+def get_news_items(count=5):
+    """Top BBC headlines with their links."""
+    root = ET.fromstring(requests.get("http://feeds.bbci.co.uk/news/rss.xml").text)
+    return [{"title": item.find("title").text.strip(), "link": item.find("link").text.strip()}
+            for item in root.findall("channel/item")[:count]]
 
 
 # ---------- Conversation loop ----------
@@ -301,7 +365,42 @@ def greeting():
     return "Good evening"
 
 
+def friendly_error(error):
+    """Turn an exception into something readable for either interface."""
+    if getattr(error, "code", None) == 429:
+        if "PerDay" in str(error):
+            return "I've used up today's free Gemini requests. Try again tomorrow."
+        return "Gemini is getting too many requests right now. Give it a minute."
+    return f"Sorry, something went wrong: {error}"
+
+
+def respond(text):
+    """AIVA's brain: work out what was asked for and return (intent, reply).
+
+    Both faces (the terminal loop below and the Streamlit app) call this, so
+    they always behave the same way.
+    """
+    # Quick exit that works even if Gemini or the internet is down.
+    if text.lower() in EXIT_WORDS:
+        return "bye", "See you later!"
+
+    try:
+        intent = classify_intent(text)
+        if intent == "bye":
+            return intent, "See you later!"
+        if intent == "word_of_day":
+            return intent, word_of_the_day_message()
+        if intent == "news":
+            return intent, news_message()
+        if intent == "todo":
+            return intent, add_todo(text)
+        return "none", HELP_TEXT
+    except Exception as error:
+        return "error", friendly_error(error)
+
+
 def main():
+    """Terminal version. For the nicer interface, run: streamlit run aiva_app.py"""
     print(f"AIVA: {greeting()}! {HELP_TEXT}")
 
     while True:
@@ -314,34 +413,10 @@ def main():
         if not text:
             continue
 
-        # Quick exit that works even if Gemini or the internet is down.
-        if text.lower() in EXIT_WORDS:
-            print("AIVA: See you later!")
+        intent, reply = respond(text)
+        print(f"AIVA: {reply}")
+        if intent == "bye":
             break
-
-        # One failure (no internet, a Gemini hiccup) shouldn't close AIVA.
-        try:
-            intent = classify_intent(text)
-
-            if intent == "bye":
-                print("AIVA: See you later!")
-                break
-            elif intent == "word_of_day":
-                show_word_of_the_day()
-            elif intent == "news":
-                show_news()
-            elif intent == "todo":
-                add_todo(text)
-            else:
-                print(f"AIVA: {HELP_TEXT}")
-        except Exception as error:
-            if getattr(error, "code", None) == 429:
-                if "PerDay" in str(error):
-                    print("AIVA: I've used up today's free Gemini requests. Try again tomorrow.")
-                else:
-                    print("AIVA: Gemini is getting too many requests right now. Give it a minute.")
-            else:
-                print(f"AIVA: Sorry, something went wrong: {error}")
 
 
 if __name__ == "__main__":
